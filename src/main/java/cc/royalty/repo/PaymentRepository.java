@@ -23,14 +23,16 @@ public class PaymentRepository {
     private static final RowMapper<PaymentRun> RUN_MAPPER = (rs, n) -> new PaymentRun(
             rs.getLong("id"), rs.getString("run_no"), rs.getLong("settlement_batch_id"),
             rs.getString("currency"), rs.getString("status"), rs.getString("created_by"),
-            rs.getObject("created_at", java.time.OffsetDateTime.class));
+            rs.getObject("created_at", java.time.OffsetDateTime.class),
+            rs.getString("run_kind"), (Long) rs.getObject("account_id"));
 
     private static final RowMapper<PaymentRequest> REQ_MAPPER = (rs, n) -> new PaymentRequest(
-            rs.getLong("id"), rs.getLong("payment_run_id"), rs.getLong("payable_id"),
+            rs.getLong("id"), rs.getLong("payment_run_id"), (Long) rs.getObject("payable_id"),
             rs.getLong("payee_id"), rs.getString("request_id"), rs.getString("account_snapshot"),
             rs.getString("body_fingerprint"), rs.getLong("amount_minor"), rs.getString("currency"),
             rs.getString("status"), rs.getObject("created_at", java.time.OffsetDateTime.class),
-            rs.getObject("confirmed_at", java.time.OffsetDateTime.class));
+            rs.getObject("confirmed_at", java.time.OffsetDateTime.class),
+            (Long) rs.getObject("escrow_entry_id"), (Long) rs.getObject("arbitration_id"));
 
     private static final RowMapper<PaymentReceipt> RECEIPT_MAPPER = (rs, n) -> new PaymentReceipt(
             rs.getLong("id"), rs.getString("receipt_ref"), rs.getString("request_id_ref"),
@@ -47,6 +49,14 @@ public class PaymentRepository {
         return jdbc.queryForObject("insert into payment_run(run_no, settlement_batch_id, currency, status, created_by) "
                 + "values (?,?,?, 'GENERATED', ?) returning id",
                 Long.class, runNo, settlementBatchId, currency, actor);
+    }
+
+    /** 托管付款运行：与托管账户绑定，run_kind=ESCROW；批次列取首笔冻结来源批次 */
+    public long insertEscrowRun(String runNo, long settlementBatchId, long accountId,
+                                String currency, String actor) {
+        return jdbc.queryForObject("insert into payment_run(run_no, settlement_batch_id, currency, status, "
+                + "created_by, run_kind, account_id) values (?,?,?, 'GENERATED', ?, 'ESCROW', ?) returning id",
+                Long.class, runNo, settlementBatchId, currency, actor, accountId);
     }
 
     public Optional<PaymentRun> findRunByNo(String no) {
@@ -70,6 +80,19 @@ public class PaymentRepository {
                 bodyFingerprint, amount, currency);
     }
 
+    /** 托管付款请求：绑定托管释放分录与裁决；payable/entry 可空（纯出账指令） */
+    public long insertEscrowRequest(long runId, Long payableId, long payeeId, String requestId,
+                                    String accountSnapshot, String bodyFingerprint, long amount,
+                                    String currency, Long escrowEntryId, Long arbitrationId) {
+        return jdbc.queryForObject("""
+                insert into payment_request(payment_run_id, payable_id, payee_id, request_id,
+                    account_snapshot, body_fingerprint, amount_minor, currency, status,
+                    escrow_entry_id, arbitration_id)
+                values (?,?,?,?,?,?,?,?,'ISSUED',?,?) returning id""",
+                Long.class, runId, payableId, payeeId, requestId, accountSnapshot,
+                bodyFingerprint, amount, currency, escrowEntryId, arbitrationId);
+    }
+
     public Optional<PaymentRequest> findRequestByRequestId(String requestId) {
         return jdbc.query("select * from payment_request where request_id=?", REQ_MAPPER, requestId)
                 .stream().findFirst();
@@ -83,12 +106,37 @@ public class PaymentRepository {
         return jdbc.query("select * from payment_request where payment_run_id=? order by id", REQ_MAPPER, runId);
     }
 
+    public List<PaymentRequest> requestsByArbitration(long arbitrationId) {
+        return jdbc.query("select * from payment_request where arbitration_id=? order by id",
+                REQ_MAPPER, arbitrationId);
+    }
+
+    public List<PaymentRequest> requestsByPayable(long payableId) {
+        return jdbc.query("select * from payment_request where payable_id=? order by id",
+                REQ_MAPPER, payableId);
+    }
+
+    public List<PaymentRun> escrowRunsOfAccount(long accountId) {
+        return jdbc.query("select * from payment_run where account_id=? and run_kind='ESCROW' order by id",
+                RUN_MAPPER, accountId);
+    }
+
+    public java.util.Optional<PaymentRun> findRunById(long id) {
+        return jdbc.query("select * from payment_run where id=?", RUN_MAPPER, id).stream().findFirst();
+    }
+
     public void updateRequestStatus(long id, String status) {
         jdbc.update("update payment_request set status=? where id=?", status, id);
     }
 
     public void confirmRequest(long id) {
         jdbc.update("update payment_request set status='CONFIRMED', confirmed_at=now() where id=?", id);
+    }
+
+    /** 裁决撤回：暂停未确认的托管付款请求，防止其继续出款 */
+    public void suspendRequest(long id) {
+        jdbc.update("update payment_request set status='SUSPENDED' where id=? "
+                + "and status in ('ISSUED','TIMEOUT_QUERIED')", id);
     }
 
     public void insertFile(long runId, String fileName, String filePath, String fingerprint) {

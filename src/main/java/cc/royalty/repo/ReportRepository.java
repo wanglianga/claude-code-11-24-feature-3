@@ -203,11 +203,19 @@ public class ReportRepository {
 
     // ---------- 挂账余额 ----------
 
-    public void insertHold(long settlementBatchId, Long reportLineId, String rightType, String type,
+    public long insertHold(long settlementBatchId, Long reportLineId, String rightType, String type,
                            long amountMinor, String currency, String reason) {
-        jdbc.update("insert into hold_balance(settlement_batch_id, report_line_id, right_type, balance_type, "
-                + "amount_minor, currency, reason) values (?,?,?,?,?,?,?)",
-                settlementBatchId, reportLineId, rightType, type, amountMinor, currency, reason);
+        var keyHolder = new org.springframework.jdbc.support.GeneratedKeyHolder();
+        jdbc.update(new org.springframework.jdbc.core.PreparedStatementCreatorFactory(
+                "insert into hold_balance(settlement_batch_id, report_line_id, right_type, balance_type, "
+                        + "amount_minor, currency, reason) values (?,?,?,?,?,?,?)",
+                java.sql.Types.BIGINT, java.sql.Types.BIGINT, java.sql.Types.VARCHAR,
+                java.sql.Types.VARCHAR, java.sql.Types.BIGINT, java.sql.Types.CHAR,
+                java.sql.Types.VARCHAR)
+                .newPreparedStatementCreator(new Object[]{settlementBatchId, reportLineId, rightType,
+                        type, amountMinor, currency, reason}), keyHolder);
+        Number key = keyHolder.getKey();
+        return key == null ? -1 : key.longValue();
     }
 
     public List<HoldBalance> holdsOfBatch(long batchId) {
@@ -215,7 +223,56 @@ public class ReportRepository {
                 (rs, n) -> new HoldBalance(rs.getLong("id"), rs.getLong("settlement_batch_id"),
                         (Long) rs.getObject("report_line_id"), rs.getString("right_type"),
                         rs.getString("balance_type"), rs.getLong("amount_minor"), rs.getString("currency"),
-                        rs.getString("reason"), rs.getBoolean("resolved"), rs.getString("resolution_note")),
+                        rs.getString("reason"), rs.getBoolean("resolved"), rs.getString("resolution_note"),
+                        rs.getLong("frozen_minor")),
                 batchId);
+    }
+
+    public Optional<HoldBalance> findHoldById(long id) {
+        return jdbc.query("select * from hold_balance where id=?", (rs, n) -> new HoldBalance(
+                rs.getLong("id"), rs.getLong("settlement_batch_id"),
+                (Long) rs.getObject("report_line_id"), rs.getString("right_type"),
+                rs.getString("balance_type"), rs.getLong("amount_minor"), rs.getString("currency"),
+                rs.getString("reason"), rs.getBoolean("resolved"), rs.getString("resolution_note"),
+                rs.getLong("frozen_minor")), id).stream().findFirst();
+    }
+
+    /** 挂账增加冻结额，不得超过挂账余额（重叠争议求并集后只会调用一次） */
+    public void addHoldFrozen(long holdId, long delta) {
+        int n = jdbc.update("update hold_balance set frozen_minor = frozen_minor + ? "
+                + "where id = ? and frozen_minor + ? <= amount_minor", delta, holdId, delta);
+        if (n == 0) {
+            throw new cc.royalty.common.DomainException(
+                    "挂账 " + holdId + " 可冻结余额不足，不能重复冻结同一份额");
+        }
+    }
+
+    /** 结算引擎回填：挂账台账行与分摊行一一对应，托管据此在两侧同步冻结留痕 */
+    public void linkHoldAllocation(long holdId, long allocationId) {
+        jdbc.update("update hold_balance set settlement_allocation_id=? where id=?", allocationId, holdId);
+    }
+
+    public Optional<Long> holdIdByAllocation(long allocationId) {
+        return jdbc.query("select id from hold_balance where settlement_allocation_id=?",
+                (rs, n) -> rs.getLong(1), allocationId).stream().findFirst();
+    }
+
+    /** 无主挂账转付受益人：挂账余额与冻结额同步核减 */
+    public void reduceHold(long holdId, long delta) {
+        int n = jdbc.update("update hold_balance set amount_minor = amount_minor - ?, "
+                + "frozen_minor = frozen_minor - ? where id=? and frozen_minor >= ?",
+                delta, delta, holdId, delta);
+        if (n == 0) {
+            throw new cc.royalty.common.DomainException("挂账 " + holdId + " 余额不足以转付");
+        }
+    }
+
+    /** 无主挂账解除冻结：仅回退冻结额，钱仍留在挂账台账 */
+    public void releaseHoldFrozen(long holdId, long delta) {
+        int n = jdbc.update("update hold_balance set frozen_minor = frozen_minor - ? "
+                + "where id=? and frozen_minor >= ?", delta, holdId, delta);
+        if (n == 0) {
+            throw new cc.royalty.common.DomainException("挂账 " + holdId + " 冻结余额不足以释放");
+        }
     }
 }

@@ -193,8 +193,9 @@ public class SettlementService {
                         true, String.join("; ", income.problems()), "REVIEW_HOLD",
                         "无法确定可分配收入: " + String.join("; ", income.problems()), sourceFp, seg);
                 settlements.insertAllocation(slId, null, null, "HELD", 0, 1, rawMoney);
-                reports.insertHold(batchId, line.id(), null, "WITHHOLD", rawMoney,
+                long holdId = reports.insertHold(batchId, line.id(), null, "WITHHOLD", rawMoney,
                         line.currency(), String.join("; ", income.problems()));
+                reports.linkHoldAllocation(holdId, settlements.allocationsOfLine(slId).get(0).id());
                 continue;
             }
 
@@ -215,10 +216,11 @@ public class SettlementService {
                             rb.distributableMinor(), rb.feeMinor(), rb.basis(), rb.rateUsed(),
                             false, "无已审平台映射，待归属", "REVIEW_HOLD",
                             "平台编号 " + line.platformItemCode() + " 缺少已审核映射", sourceFp, seg);
-                    settlements.insertAllocation(slId, null, null, "HELD", 0, 1, rb.distributableMinor());
-                    reports.insertHold(batchId, line.id(), rb.rightType(), "UNMATCHED",
+                    long heldAllocId = settlements.insertAllocation(slId, null, null, "HELD", 0, 1, rb.distributableMinor());
+                    long unmatchedHold = reports.insertHold(batchId, line.id(), rb.rightType(), "UNMATCHED",
                             rb.distributableMinor(), line.currency(),
                             "标题/作者/时长仅为候选，未经人工采用不归属");
+                    reports.linkHoldAllocation(unmatchedHold, heldAllocId);
                     continue;
                 }
 
@@ -231,9 +233,10 @@ public class SettlementService {
                             rb.distributableMinor(), rb.feeMinor(), rb.basis(), rb.rateUsed(),
                             true, String.join("; ", r.reasons()), "REVIEW_HOLD",
                             "合同冲突，整笔暂扣", sourceFp, seg);
-                    settlements.insertAllocation(slId, null, null, "HELD", 0, 1, rb.distributableMinor());
-                    reports.insertHold(batchId, line.id(), rb.rightType(), "CONFLICT_HOLD",
+                    long conflictAllocId = settlements.insertAllocation(slId, null, null, "HELD", 0, 1, rb.distributableMinor());
+                    long conflictHoldId = reports.insertHold(batchId, line.id(), rb.rightType(), "CONFLICT_HOLD",
                             rb.distributableMinor(), line.currency(), String.join("; ", r.reasons()));
+                    reports.linkHoldAllocation(conflictHoldId, conflictAllocId);
                     continue;
                 }
 
@@ -253,11 +256,12 @@ public class SettlementService {
                         continue;
                     }
                     if (p.disputed()) {
-                        settlements.insertAllocation(slId, p.payeeId(), p.contractId(), "HELD",
+                        long disputedAllocId = settlements.insertAllocation(slId, p.payeeId(), p.contractId(), "HELD",
                                 p.weight().numerator().longValueExact(),
                                 p.weight().denominator().longValueExact(), p.amountMinor());
-                        reports.insertHold(batchId, line.id(), rb.rightType(), "CONFLICT_HOLD",
+                        long disputedHoldId = reports.insertHold(batchId, line.id(), rb.rightType(), "CONFLICT_HOLD",
                                 p.amountMinor(), line.currency(), p.note());
+                        reports.linkHoldAllocation(disputedHoldId, disputedAllocId);
                     } else {
                         settlements.insertAllocation(slId, p.payeeId(), p.contractId(), "ALLOCATED",
                                 p.weight().numerator().longValueExact(),
@@ -269,12 +273,13 @@ public class SettlementService {
                 }
                 if (r.unclaimedMinor() > 0) {
                     Rational missing = Rational.ONE.subtract(r.totalWeight());
-                    settlements.insertAllocation(slId, null, null, "UNCLAIMED",
+                    long unclaimedAllocId = settlements.insertAllocation(slId, null, null, "UNCLAIMED",
                             missing.numerator().longValueExact(),
                             missing.denominator().longValueExact(), r.unclaimedMinor());
-                    reports.insertHold(batchId, line.id(), rb.rightType(), "UNCLAIMED",
+                    long unclaimedHoldId = reports.insertHold(batchId, line.id(), rb.rightType(), "UNCLAIMED",
                             r.unclaimedMinor(), line.currency(),
                             "权利份额合计不足 100%，剩余款待认领，不放大已知人比例");
+                    reports.linkHoldAllocation(unclaimedHoldId, unclaimedAllocId);
                     allocSum += r.unclaimedMinor();
                 }
                 // 逐笔守恒硬断言：各分摊之和必须等于可分配额
@@ -292,11 +297,12 @@ public class SettlementService {
                         income.budgetUnclaimedMinor(), 0, basis, null, false,
                         "权利类型预算合计不足 100%", "REVIEW_HOLD",
                         "预算未覆盖余额，待明确预算分配后认领", sourceFp, seg);
-                settlements.insertAllocation(slId, null, null, "UNCLAIMED", 0, 1,
+                long budgetUnclaimedAlloc = settlements.insertAllocation(slId, null, null, "UNCLAIMED", 0, 1,
                         income.budgetUnclaimedMinor());
-                reports.insertHold(batchId, line.id(), null, "UNCLAIMED",
+                long budgetHoldId = reports.insertHold(batchId, line.id(), null, "UNCLAIMED",
                         income.budgetUnclaimedMinor(), line.currency(),
                         "权利类型预算合计不足 100%，剩余款待认领，词曲与录音均不得领走整笔");
+                reports.linkHoldAllocation(budgetHoldId, budgetUnclaimedAlloc);
             }
         }
     }

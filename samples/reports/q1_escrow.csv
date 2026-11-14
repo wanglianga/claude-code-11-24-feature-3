@@ -1,0 +1,8 @@
+#BATCH,REPORT-PLFA-ESCROW-2026Q1,PLF-A,2026-01-01,2026-03-31,6,0,0,0,USD
+platform_line_no,revision_no,supersedes_line_no,platform_item_code,reported_title,reported_artist,reported_duration,usage_date,territory,media,usage_count,gross_minor,fee_minor,net_minor,currency,action
+E-001,1,,PLF-ME-ORIG,Midnight Echo,Delta Moon,210,2026-02-01,US,STREAM,100,0,0,0,USD,NORMAL
+E-002,1,,PLF-ME-ORIG,Midnight Echo,Delta Moon,210,2026-02-01,EU,STREAM,100,0,0,0,USD,NORMAL
+E-003,1,,PLF-ME-ORIG,Midnight Echo,Delta Moon,210,2026-02-01,JP,STREAM,100,0,0,0,USD,NORMAL
+E-004,1,,PLF-ME-ORIG,Midnight Echo,Delta Moon,210,2026-03-01,US,STREAM,100,0,0,0,USD,NORMAL
+E-005,1,,PLF-ME-ORIG,Midnight Echo,Delta Moon,210,2026-03-01,EU,STREAM,100,0,0,0,USD,NORMAL
+E-006,1,,PLF-ME-ORIG,Midnight Echo,Delta Moon,210,2026-03-01,JP,STREAM,100,0,0,0,USD,NORMAL

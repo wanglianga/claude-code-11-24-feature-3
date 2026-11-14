@@ -5,6 +5,7 @@ import cc.royalty.common.DomainException;
 import cc.royalty.common.Fingerprints;
 import cc.royalty.domain.*;
 import cc.royalty.repo.CatalogRepository;
+import cc.royalty.repo.EscrowRepository;
 import cc.royalty.repo.PaymentRepository;
 import cc.royalty.repo.SettlementRepository;
 import org.springframework.beans.factory.annotation.Value;
@@ -31,15 +32,20 @@ public class PaymentService {
     private final PaymentRepository payments;
     private final SettlementRepository settlements;
     private final CatalogRepository catalog;
+    private final EscrowRepository escrow;
+    private final EscrowService escrowService;
 
     @Value("${app.storage.payment-dir:data/payment-files}")
     private String paymentDir;
 
     public PaymentService(PaymentRepository payments, SettlementRepository settlements,
-                          CatalogRepository catalog) {
+                          CatalogRepository catalog, EscrowRepository escrow,
+                          EscrowService escrowService) {
         this.payments = payments;
         this.settlements = settlements;
         this.catalog = catalog;
+        this.escrow = escrow;
+        this.escrowService = escrowService;
     }
 
     public record RunResult(long runId, String runNo, String currency, String status,
@@ -68,6 +74,7 @@ public class PaymentService {
         }
 
         List<Payable> payables = settlements.payablesOfBatch(batchId).stream()
+                .filter(p -> "SETTLEMENT".equals(p.sourceKind()))
                 .filter(p -> p.currency().equals(currency) && p.outstanding() > 0
                         && List.of("APPROVED", "PARTIALLY_PAID", "QUEUED").contains(p.status()))
                 .toList();
@@ -144,7 +151,10 @@ public class PaymentService {
                 mismatch = "UNKNOWN_REQUEST";
             } else {
                 PaymentRequest req = reqOpt.get();
-                if (req.amountMinor() != amount) {
+                if ("SUSPENDED".equals(req.status())) {
+                    // 裁决撤回已暂停该托管付款：回执不再可能匹配，防止另一路解冻重复支付
+                    mismatch = "SUSPENDED";
+                } else if (req.amountMinor() != amount) {
                     mismatch = "MISMATCH_AMOUNT";
                 } else if (!req.currency().equals(currency)) {
                     mismatch = "MISMATCH_CURRENCY";
@@ -168,6 +178,11 @@ public class PaymentService {
                     Payable p = settlements.findPayableById(req.payableId()).orElseThrow();
                     settlements.updatePayableStatus(p.id(),
                             p.paidMinor() >= p.amountMinor() ? "PAID" : "PARTIALLY_PAID");
+                    // 托管付款：回执确认后资金才真正离开托管，按执行线 FIFO 出账并写释放/转付分录
+                    if (req.isEscrowPayment()) {
+                        escrowService.confirmEscrowPayment(
+                                payments.findRequestByRequestId(requestId).orElseThrow());
+                    }
                 }
                 matched++;
                 refreshRunStatus(req.paymentRunId());
@@ -177,6 +192,7 @@ public class PaymentService {
                     case "MISMATCH_AMOUNT" -> "回执金额与请求金额不一致";
                     case "MISMATCH_CURRENCY" -> "回执币种与请求币种不一致";
                     case "MISMATCH_ACCOUNT" -> "回执账户与付款生成时账户快照不一致";
+                    case "SUSPENDED" -> "付款请求已因裁决撤回暂停，回执不得确认";
                     case "DUPLICATE" -> "回执编号重复";
                     default -> mismatch;
                 };
@@ -259,6 +275,82 @@ public class PaymentService {
         settlements.approve(newBatchId, actor);
         return Map.of("adjustment_no", adjustmentNo, "new_settlement_batch_id", newBatchId,
                 "status", "APPROVED");
+    }
+
+    // ---------- 托管付款：付款文件与托管释放分录绑定，回执未确认仍占待付额 ----------
+
+    /**
+     * 为托管账户生成付款文件（幂等）。只拾取 ESCROW_RELEASE/ESCROW_TRANSFER 应付，
+     * 每个请求绑定触发它的托管分录与裁决；文件生成后回执未确认前应付仍占待付额，
+     * 另一路解冻无法对同一笔款重复支付。
+     */
+    @Transactional
+    public Map<String, Object> generateEscrowPaymentRun(String accountNo, String actor) {
+        cc.royalty.domain.EscrowAccount account = escrow.findAccountByNo(accountNo)
+                .orElseThrow(() -> new DomainException("托管账户不存在: " + accountNo));
+        List<Payable> allDues = settlements.escrowSourcePayables().stream()
+                .filter(p -> p.currency().equals(account.currency()) && p.outstanding() > 0
+                        && List.of("APPROVED", "PARTIALLY_PAID", "QUEUED").contains(p.status()))
+                .toList();
+        if (allDues.isEmpty()) {
+            throw new DomainException("托管账户 " + accountNo + " 当前没有待付的释放/转付款");
+        }
+        List<PaymentRun> runs = payments.escrowRunsOfAccount(account.id());
+        // 已有运行覆盖的应付不再重复出款；新增待付（后续裁决产生）另起运行
+        java.util.Set<Long> coveredPayableIds = runs.stream()
+                .flatMap(r -> payments.requestsOfRun(r.id()).stream())
+                .filter(r -> !"SUSPENDED".equals(r.status()) && r.payableId() != null)
+                .map(PaymentRequest::payableId)
+                .collect(java.util.stream.Collectors.toSet());
+        List<Payable> dues = allDues;
+        if (!runs.isEmpty()) {
+            List<Payable> fresh = dues.stream()
+                    .filter(p -> !coveredPayableIds.contains(p.id())).toList();
+            if (fresh.isEmpty()) {
+                PaymentRun run = runs.get(0);
+                List<String> files = payments.filesOfRun(run.id());
+                return Map.of("run_no", run.runNo(), "run_id", run.id(), "reused", true, "run_kind", "ESCROW",
+                        "account_no", account.accountNo(), "status", run.status(),
+                        "requests", payments.requestsOfRun(run.id()).stream()
+                                .map(PaymentRequest::requestId).toList(),
+                        "file", files.isEmpty() ? null : files.get(0));
+            }
+            dues = fresh;
+        }
+        long anchorBatch = dues.get(0).settlementBatchId();
+        int seq = runs.size() + 1;
+        String runNo = "ER" + String.format("%08d", account.id()) + "-" + account.currency()
+                + (seq == 1 ? "" : "-" + seq);
+        long runId = payments.insertEscrowRun(runNo, anchorBatch, account.id(), account.currency(), actor);
+
+        List<String> bodyLines = new ArrayList<>();
+        bodyLines.add("request_id,payee_code,payee_name,account_snapshot,amount_minor,currency,"
+                + "source_kind,arbitration_id,body_fingerprint");
+        List<String> requestIds = new ArrayList<>();
+        for (Payable p : dues) {
+            Payee payee = catalog.findPayeeById(p.payeeId()).orElseThrow();
+            long amount = p.outstanding();
+            String snapshot = payee.bankAccount() == null ? "NO-ACCOUNT" : payee.bankAccount();
+            // 托管应付由裁决执行线产生；回执确认时才写释放分录并回填 payment_request_id
+            Long arbId = escrow.arbitrationIdForPayable(p.id()).orElse(null);
+            String canonical = String.join("|", runNo, payee.payeeCode(), snapshot,
+                    String.valueOf(amount), account.currency(), String.valueOf(p.id()), p.sourceKind());
+            String bodyFp = Fingerprints.sha256(canonical);
+            String requestId = "ERQ" + Fingerprints.sha256(canonical).substring(0, 16).toUpperCase();
+            payments.insertEscrowRequest(runId, p.id(), p.payeeId(), requestId, snapshot, bodyFp,
+                    amount, account.currency(), null, arbId);
+            settlements.updatePayableStatus(p.id(), "QUEUED");
+            bodyLines.add(String.join(",", requestId, payee.payeeCode(), payee.payeeName(), snapshot,
+                    String.valueOf(amount), account.currency(), p.sourceKind(),
+                    String.valueOf(arbId), bodyFp));
+            requestIds.add(requestId);
+        }
+        String content = String.join("\n", bodyLines) + "\n";
+        String filePath = writeFile(runNo, runNo + ".csv", content);
+        payments.insertFile(runId, runNo + ".csv", filePath, Fingerprints.sha256(content));
+        return Map.of("run_no", runNo, "run_id", runId, "reused", false, "run_kind", "ESCROW",
+                "account_no", account.accountNo(), "requests", requestIds, "file", filePath,
+                "note", "回执确认前资金仍占托管待付额；裁决撤回会暂停未确认请求，不会重复支付");
     }
 
     private String writeFile(String runNo, String fileName, String content) {
